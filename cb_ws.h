@@ -36,6 +36,14 @@ extern "C" {
      */
     int cb_ws_run_eth_ticker(const char *endpoint_wss, const char *csv_path, eth_stats_t *out_stats);
 
+    /**
+     * Connects to Kraken WebSocket feed and streams ticker updates for ETH/USD.
+     * Blocks in the event loop until SIGINT or connection failure.
+     *
+     * Returns 0 on normal shutdown, non-zero on error.
+     */
+    int kraken_ws_run_eth_ticker(const char *endpoint_wss, const char *csv_path, eth_stats_t *out_stats);
+
 #ifdef __cplusplus
 }
 #endif

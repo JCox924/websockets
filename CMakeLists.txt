@@ -11,6 +11,7 @@ pkg_check_modules(LWS REQUIRED libwebsockets)
 add_executable(untitled
         main.c
         cb_ws.c
+        kraken_ws.c
         jsmn.c
 )
 
