@@ -14,11 +14,12 @@
 #define KRAKEN_PRODUCT "ETH/USD"
 #define KRAKEN_DEFAULT_ENDPOINT "wss://ws.kraken.com"
 
-static volatile sig_atomic_t g_should_exit = 0;
+static volatile sig_atomic_t g_default_stop_flag = 0;
+static volatile sig_atomic_t *g_stop_flag = &g_default_stop_flag;
 
 static void on_sigint(int sig) {
     (void)sig;
-    g_should_exit = 1;
+    *g_stop_flag = 1;
 }
 
 /* ---------- Time helpers ---------- */
@@ -403,12 +404,12 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
         case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
             fprintf(stderr, "Connection error: %s\n", in ? (const char *)in : "(unknown)");
-            g_should_exit = 1;
+            *g_stop_flag = 1;
             break;
 
         case LWS_CALLBACK_CLIENT_CLOSED:
             fprintf(stderr, "Connection closed.\n");
-            g_should_exit = 1;
+            *g_stop_flag = 1;
             break;
 
         default:
@@ -420,15 +421,23 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
 /* ---------- Public entrypoint ---------- */
 
-int kraken_ws_run_eth_ticker(const char *endpoint_wss, const char *csv_path, eth_stats_t *out_stats) {
+int kraken_ws_run_eth_ticker(const char *endpoint_wss,
+                             const char *csv_path,
+                             eth_stats_t *out_stats,
+                             volatile sig_atomic_t *stop_flag) {
     if (!endpoint_wss || !*endpoint_wss) endpoint_wss = KRAKEN_DEFAULT_ENDPOINT;
     if (!out_stats) return 2;
 
     memset(out_stats, 0, sizeof(*out_stats));
     strncpy(out_stats->product_id, KRAKEN_PRODUCT, sizeof(out_stats->product_id) - 1);
 
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
+    g_default_stop_flag = 0;
+    g_stop_flag = stop_flag ? stop_flag : &g_default_stop_flag;
+
+    if (!stop_flag) {
+        signal(SIGINT, on_sigint);
+        signal(SIGTERM, on_sigint);
+    }
 
     app_state_t st;
     memset(&st, 0, sizeof(st));
@@ -497,7 +506,7 @@ int kraken_ws_run_eth_ticker(const char *endpoint_wss, const char *csv_path, eth
 
     fprintf(stderr, "Connecting to Kraken %s ... (Ctrl+C to stop)\n", endpoint_wss);
 
-    while (!g_should_exit) {
+    while (!*g_stop_flag) {
         lws_service(ctx, 200);
     }
 
