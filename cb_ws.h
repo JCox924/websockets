@@ -5,6 +5,7 @@
 #define CB_WS_H
 
 #include <stdint.h>
+#include <signal.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,7 +35,21 @@ extern "C" {
      *
      * Returns 0 on normal shutdown, non-zero on error.
      */
-    int cb_ws_run_eth_ticker(const char *endpoint_wss, const char *csv_path, eth_stats_t *out_stats);
+    int cb_ws_run_eth_ticker(const char *endpoint_wss,
+                             const char *csv_path,
+                             eth_stats_t *out_stats,
+                             volatile sig_atomic_t *stop_flag);
+
+    /**
+     * Connects to Kraken WebSocket feed and streams ticker updates for ETH/USD.
+     * Blocks in the event loop until SIGINT or connection failure.
+     *
+     * Returns 0 on normal shutdown, non-zero on error.
+     */
+    int kraken_ws_run_eth_ticker(const char *endpoint_wss,
+                                 const char *csv_path,
+                                 eth_stats_t *out_stats,
+                                 volatile sig_atomic_t *stop_flag);
 
 #ifdef __cplusplus
 }

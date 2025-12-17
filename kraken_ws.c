@@ -11,8 +11,8 @@
 
 #include "jsmn.h"
 
-#define PRODUCT_ID "ETH-USD"
-#define DEFAULT_ENDPOINT "wss://ws-feed.exchange.coinbase.com"
+#define KRAKEN_PRODUCT "ETH/USD"
+#define KRAKEN_DEFAULT_ENDPOINT "wss://ws.kraken.com"
 
 static volatile sig_atomic_t g_default_stop_flag = 0;
 static volatile sig_atomic_t *g_stop_flag = &g_default_stop_flag;
@@ -42,48 +42,16 @@ static uint64_t now_monotonic_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* Parse RFC3339 UTC timestamps like:
-   2025-12-16T06:16:56.509354Z -> epoch ns (UTC)
-   Returns 0 on failure. */
-static uint64_t parse_rfc3339_utc_ns(const char *s) {
-    if (!s || !*s) return 0;
+static void iso8601_from_ns(uint64_t ns, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
 
+    time_t sec = (time_t)(ns / 1000000000ULL);
     struct tm tm;
-    memset(&tm, 0, sizeof(tm));
+    gmtime_r(&sec, &tm);
 
-    /* Copy until '.' or 'Z' */
-    char base[32] = {0};
-    size_t i = 0;
-    for (; s[i] && s[i] != '.' && s[i] != 'Z' && i < sizeof(base) - 1; i++) {
-        base[i] = s[i];
-    }
-    base[i] = '\0';
-
-    char *r = strptime(base, "%Y-%m-%dT%H:%M:%S", &tm);
-    if (!r) return 0;
-
-    /* Fractional seconds */
-    uint64_t frac_ns = 0;
-    const char *p = s + i;
-    if (*p == '.') {
-        p++;
-        uint64_t scale = 100000000ULL; /* first digit => 1e8 ns */
-        while (*p >= '0' && *p <= '9' && scale > 0) {
-            frac_ns += (uint64_t)(*p - '0') * scale;
-            scale /= 10;
-            p++;
-        }
-        while (*p >= '0' && *p <= '9') p++; /* skip extra digits */
-    }
-
-    while (*p == ' ') p++;
-    if (*p != 'Z') return 0;
-
-    /* Convert tm (UTC) -> epoch seconds */
-    time_t sec = timegm(&tm);
-    if (sec < 0) return 0;
-
-    return (uint64_t)sec * 1000000000ULL + frac_ns;
+    snprintf(out, out_sz, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
 /* ---------- JSON helpers (jsmn) ---------- */
@@ -93,6 +61,22 @@ static int json_token_streq(const char *json, const jsmntok_t *tok, const char *
     return (tok->type == JSMN_STRING &&
             strlen(s) == len &&
             strncmp(json + tok->start, s, len) == 0);
+}
+
+static int skip_token(jsmntok_t *toks, int idx) {
+    int next = idx + 1;
+    if (toks[idx].type == JSMN_ARRAY || toks[idx].type == JSMN_OBJECT) {
+        for (int i = 0; i < toks[idx].size; i++) {
+            next = skip_token(toks, next);
+        }
+    }
+    return next;
+}
+
+static int token_count(jsmntok_t *toks, int ntok, int idx) {
+    int next = skip_token(toks, idx);
+    if (next > ntok) return 0;
+    return next - idx;
 }
 
 static int json_get_string(const char *json, jsmntok_t *toks, int ntok,
@@ -129,13 +113,28 @@ static int json_get_number(const char *json, jsmntok_t *toks, int ntok,
     return -1;
 }
 
-static int json_get_u64(const char *json, jsmntok_t *toks, int ntok,
-                        const char *key, uint64_t *out) {
-    double d = 0.0;
-    if (json_get_number(json, toks, ntok, key, &d) == 0) {
-        if (d < 0) d = 0;
-        *out = (uint64_t)d;
-        return 0;
+static int json_get_array_element_number(const char *json, jsmntok_t *toks, int ntok,
+                                         const char *key, int array_idx, double *out) {
+    for (int i = 1; i < ntok - 1; i++) {
+        if (toks[i].type == JSMN_STRING && json_token_streq(json, &toks[i], key)) {
+            jsmntok_t *arr = &toks[i + 1];
+            if (arr->type != JSMN_ARRAY || array_idx >= arr->size) return -1;
+            int j = i + 2; /* first element */
+            for (int k = 0; k < arr->size; k++) {
+                if (k == array_idx) {
+                    jsmntok_t *elem = &toks[j];
+                    char tmp[64];
+                    size_t len = (size_t)(elem->end - elem->start);
+                    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+                    memcpy(tmp, json + elem->start, len);
+                    tmp[len] = '\0';
+                    *out = strtod(tmp, NULL);
+                    return 0;
+                }
+                j = skip_token(toks, j);
+            }
+            return -1;
+        }
     }
     return -1;
 }
@@ -150,9 +149,6 @@ typedef struct app_state {
     size_t rx_cap;
 
     int subscribed;
-
-    /* Heartbeat cadence */
-    uint64_t last_hb_mono_ns;
 
     /* CSV logging */
     FILE *csv;
@@ -179,26 +175,23 @@ static void reset_rx(app_state_t *st) {
 static int csv_open(app_state_t *st, const char *path) {
     if (!path || !*path) return 0;
 
-    st->csv = fopen(path, "a+");   /* read/write, append */
+    st->csv = fopen(path, "a+");
     if (!st->csv) {
         fprintf(stderr, "CSV open failed (%s): %s\n", path, strerror(errno));
         return -1;
     }
 
-    /* Optional: keep buffering for performance */
     setvbuf(st->csv, NULL, _IOFBF, 1 << 20);
 
-    /* Detect whether file already has content */
     fseek(st->csv, 0, SEEK_END);
     long sz = ftell(st->csv);
     if (sz > 0) {
-        st->csv_header_written = 1; /* don't write another header */
+        st->csv_header_written = 1;
     }
 
     fprintf(stderr, "CSV logging to: %s\n", path);
     return 0;
 }
-
 
 static void csv_close(app_state_t *st) {
     if (st->csv) {
@@ -257,83 +250,39 @@ static void csv_write_ticker_row(app_state_t *st,
             trade_size_est);
     static uint64_t row_count = 0;
     row_count++;
-    if ((row_count % 200) == 0) {   /* flush every 200 ticks */
+    if ((row_count % 200) == 0) {
         fflush(st->csv);
     }
-
 }
 
-/* ---------- Message parsing ---------- */
+/* ---------- Kraken message parsing ---------- */
 
-static void parse_and_update(app_state_t *st, const char *msg, size_t msg_len,
-                             uint64_t recv_rt_ns, uint64_t recv_mono_ns) {
-    jsmn_parser p;
-    jsmntok_t toks[256];
-
-    jsmn_init(&p);
-    int ntok = jsmn_parse(&p, msg, (int)msg_len, toks, (int)(sizeof(toks) / sizeof(toks[0])));
-    if (ntok < 1 || toks[0].type != JSMN_OBJECT) return;
-
-    char type[32] = {0};
-    if (json_get_string(msg, toks, ntok, "type", type, sizeof(type)) != 0) return;
-
-    /* ---- Heartbeat ---- */
-    if (strcmp(type, "heartbeat") == 0) {
-        char product[16] = {0};
-        if (json_get_string(msg, toks, ntok, "product_id", product, sizeof(product)) != 0) return;
-        if (strcmp(product, PRODUCT_ID) != 0) return;
-
-        eth_stats_t *s = st->stats;
-        s->heartbeats += 1;
-
-        if (st->last_hb_mono_ns != 0 && recv_mono_ns > st->last_hb_mono_ns) {
-            s->last_hb_interarrival_ms = (double)(recv_mono_ns - st->last_hb_mono_ns) / 1e6;
-        }
-        st->last_hb_mono_ns = recv_mono_ns;
-
-        char hb_time[40] = {0};
-        if (json_get_string(msg, toks, ntok, "time", hb_time, sizeof(hb_time)) == 0) {
-            uint64_t hb_ns = parse_rfc3339_utc_ns(hb_time);
-            if (hb_ns > 0 && recv_rt_ns >= hb_ns) {
-                s->last_hb_latency_ms = (double)(recv_rt_ns - hb_ns) / 1e6;
-            }
-        }
-
-        /* Optional: comment out if too noisy */
-        printf("[%-6s] HEARTBEAT inter=%.2fms hb_lat=%.2fms count=%" PRIu64 "\n",
-               PRODUCT_ID, s->last_hb_interarrival_ms, s->last_hb_latency_ms, s->heartbeats);
-        fflush(stdout);
-        return;
-    }
-
-    /* ---- Ticker ---- */
-    if (strcmp(type, "ticker") != 0) return;
-
-    char product[16] = {0};
-    if (json_get_string(msg, toks, ntok, "product_id", product, sizeof(product)) != 0) return;
-    if (strcmp(product, PRODUCT_ID) != 0) return;
+static void handle_ticker(app_state_t *st, const char *msg, jsmntok_t *toks, int ntok,
+                          int data_idx, int type_idx, int pair_idx,
+                          uint64_t recv_rt_ns, uint64_t recv_mono_ns) {
+    (void)type_idx;
+    (void)pair_idx;
 
     eth_stats_t *s = st->stats;
-    strncpy(s->product_id, product, sizeof(s->product_id) - 1);
 
-    (void)json_get_number(msg, toks, ntok, "price", &s->price);
-    (void)json_get_number(msg, toks, ntok, "best_bid", &s->best_bid);
-    (void)json_get_number(msg, toks, ntok, "best_ask", &s->best_ask);
-    (void)json_get_number(msg, toks, ntok, "best_bid_size", &s->best_bid_size);
-    (void)json_get_number(msg, toks, ntok, "best_ask_size", &s->best_ask_size);
-    (void)json_get_number(msg, toks, ntok, "volume_24h", &s->volume_24h);
-    (void)json_get_string(msg, toks, ntok, "time", s->time_iso, sizeof(s->time_iso));
-    (void)json_get_u64(msg, toks, ntok, "sequence", &s->last_seq);
+    int data_ntok = token_count(toks, ntok, data_idx);
+    if (data_ntok <= 0) return;
 
-    /* 1.A: ticker event latency (recv realtime - server time) */
-    uint64_t server_ns = parse_rfc3339_utc_ns(s->time_iso);
-    if (server_ns > 0 && recv_rt_ns >= server_ns) {
-        s->last_ticker_latency_ms = (double)(recv_rt_ns - server_ns) / 1e6;
-    }
+    json_get_array_element_number(msg, &toks[data_idx], data_ntok, "c", 0, &s->price);
+    json_get_array_element_number(msg, &toks[data_idx], data_ntok, "b", 0, &s->best_bid);
+    json_get_array_element_number(msg, &toks[data_idx], data_ntok, "a", 0, &s->best_ask);
+    json_get_array_element_number(msg, &toks[data_idx], data_ntok, "b", 1, &s->best_bid_size);
+    json_get_array_element_number(msg, &toks[data_idx], data_ntok, "a", 1, &s->best_ask_size);
+    json_get_array_element_number(msg, &toks[data_idx], data_ntok, "v", 1, &s->volume_24h);
+
+    /* Kraken ticker messages do not include server time; stamp with recv time. */
+    iso8601_from_ns(recv_rt_ns, s->time_iso, sizeof(s->time_iso));
+    s->last_seq = 0;
+    s->last_ticker_latency_ms = 0.0;
+    strncpy(s->product_id, KRAKEN_PRODUCT, sizeof(s->product_id) - 1);
 
     s->updates += 1;
 
-    /* Derived features */
     double spread = 0.0;
     double mid = 0.0;
     double imbalance = 0.0;
@@ -348,24 +297,63 @@ static void parse_and_update(app_state_t *st, const char *msg, size_t msg_len,
         imbalance = (s->best_bid_size - s->best_ask_size) / denom;
     }
 
-    /* Estimate trade size from volume_24h delta (best effort) */
     double trade_size_est = 0.0;
     if (st->last_volume_24h > 0.0 && s->volume_24h >= st->last_volume_24h) {
         trade_size_est = s->volume_24h - st->last_volume_24h;
     }
     st->last_volume_24h = s->volume_24h;
 
-    /* CSV row */
-    csv_write_ticker_row(st, s, recv_rt_ns, recv_mono_ns, server_ns,
+    csv_write_ticker_row(st, s, recv_rt_ns, recv_mono_ns, recv_rt_ns,
                          spread, mid, imbalance, trade_size_est);
 
-    /* Console (optional; disable for cleaner collection runs) */
-    printf("[%-6s] price=%.2f bid=%.2f ask=%.2f vol24h=%.4f seq=%" PRIu64
-           " time=%s lat=%.2fms\n",
-           s->product_id, s->price, s->best_bid, s->best_ask, s->volume_24h,
-           s->last_seq, s->time_iso[0] ? s->time_iso : "(n/a)",
-           s->last_ticker_latency_ms);
+    printf("[KRAKEN] price=%.2f bid=%.2f ask=%.2f vol24h=%.4f time=%s\n",
+           s->price, s->best_bid, s->best_ask, s->volume_24h,
+           s->time_iso[0] ? s->time_iso : "(n/a)");
     fflush(stdout);
+}
+
+static void parse_and_update(app_state_t *st, const char *msg, size_t msg_len,
+                             uint64_t recv_rt_ns, uint64_t recv_mono_ns) {
+    jsmn_parser p;
+    jsmntok_t toks[256];
+
+    jsmn_init(&p);
+    int ntok = jsmn_parse(&p, msg, (int)msg_len, toks, (int)(sizeof(toks) / sizeof(toks[0])));
+    if (ntok < 1) return;
+
+    if (toks[0].type == JSMN_OBJECT) {
+        char event[32] = {0};
+        if (json_get_string(msg, toks, ntok, "event", event, sizeof(event)) == 0) {
+            if (strcmp(event, "heartbeat") == 0) {
+                st->stats->heartbeats += 1;
+                st->stats->last_hb_latency_ms = 0.0;
+                st->stats->last_hb_interarrival_ms = 0.0;
+                printf("[KRAKEN] HEARTBEAT count=%" PRIu64 "\n", st->stats->heartbeats);
+                fflush(stdout);
+            } else if (strcmp(event, "subscriptionStatus") == 0) {
+                char status[32] = {0};
+                if (json_get_string(msg, toks, ntok, "status", status, sizeof(status)) == 0) {
+                    fprintf(stderr, "Subscription status: %s\n", status);
+                }
+            }
+        }
+        return;
+    }
+
+    if (toks[0].type != JSMN_ARRAY || toks[0].size < 4) return;
+
+    int idx = 1; /* channel id */
+    idx = skip_token(toks, idx); /* data object */
+    int data_idx = idx;
+    idx = skip_token(toks, idx); /* type string */
+    int type_idx = idx;
+    idx = skip_token(toks, idx); /* product pair */
+    int pair_idx = idx;
+
+    if (pair_idx >= ntok || type_idx >= ntok || data_idx >= ntok) return;
+    if (toks[type_idx].type != JSMN_STRING || !json_token_streq(msg, &toks[type_idx], "ticker")) return;
+
+    handle_ticker(st, msg, toks, ntok, data_idx, type_idx, pair_idx, recv_rt_ns, recv_mono_ns);
 }
 
 /* ---------- libwebsockets callback ---------- */
@@ -379,9 +367,9 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
         case LWS_CALLBACK_CLIENT_ESTABLISHED: {
             const char *sub =
                 "{"
-                  "\"type\":\"subscribe\","
-                  "\"product_ids\":[\"" PRODUCT_ID "\"],"
-                  "\"channels\":[\"ticker\",\"heartbeat\"]"
+                  "\"event\":\"subscribe\"," 
+                  "\"pair\":[\"" KRAKEN_PRODUCT "\"],"
+                  "\"subscription\":{\"name\":\"ticker\"}"
                 "}";
 
             unsigned char buf[LWS_PRE + 256];
@@ -395,7 +383,7 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
             st->subscribed = 1;
             reset_rx(st);
 
-            fprintf(stderr, "Connected; subscribed to %s ticker + heartbeat.\n", PRODUCT_ID);
+            fprintf(stderr, "Connected; subscribed to Kraken %s ticker.\n", KRAKEN_PRODUCT);
             break;
         }
 
@@ -439,15 +427,15 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
 /* ---------- Public entrypoint ---------- */
 
-int cb_ws_run_eth_ticker(const char *endpoint_wss,
-                         const char *csv_path,
-                         eth_stats_t *out_stats,
-                         volatile sig_atomic_t *stop_flag) {
-    if (!endpoint_wss || !*endpoint_wss) endpoint_wss = DEFAULT_ENDPOINT;
+int kraken_ws_run_eth_ticker(const char *endpoint_wss,
+                             const char *csv_path,
+                             eth_stats_t *out_stats,
+                             volatile sig_atomic_t *stop_flag) {
+    if (!endpoint_wss || !*endpoint_wss) endpoint_wss = KRAKEN_DEFAULT_ENDPOINT;
     if (!out_stats) return 2;
 
     memset(out_stats, 0, sizeof(*out_stats));
-    strncpy(out_stats->product_id, PRODUCT_ID, sizeof(out_stats->product_id) - 1);
+    strncpy(out_stats->product_id, KRAKEN_PRODUCT, sizeof(out_stats->product_id) - 1);
 
     g_default_stop_flag = 0;
     g_stop_flag = stop_flag ? stop_flag : &g_default_stop_flag;
@@ -466,7 +454,7 @@ int cb_ws_run_eth_ticker(const char *endpoint_wss,
     }
 
     struct lws_protocols protocols[] = {
-        { "cb-proto", ws_callback, 0, 8192, 0, NULL, 0 },
+        { "kraken-proto", ws_callback, 0, 8192, 0, NULL, 0 },
         { NULL, NULL, 0, 0, 0, NULL, 0 }
     };
 
@@ -522,7 +510,7 @@ int cb_ws_run_eth_ticker(const char *endpoint_wss,
         return 4;
     }
 
-    fprintf(stderr, "Connecting to %s ... (Ctrl+C to stop)\n", endpoint_wss);
+    fprintf(stderr, "Connecting to Kraken %s ... (Ctrl+C to stop)\n", endpoint_wss);
 
     while (!(*g_stop_flag)) {
         lws_service(ctx, 200);
@@ -533,3 +521,4 @@ int cb_ws_run_eth_ticker(const char *endpoint_wss,
     csv_close(&st);
     return 0;
 }
+
